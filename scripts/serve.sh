@@ -4,7 +4,7 @@
 # The checkpoint is 126.0 GiB and the Spark has 121.63 GiB of unified memory.
 # It fits because of the two patches applied by prepare.sh -- see ../README.md.
 #
-# Env: MEMFRAC CTX PREFILL ATTN SPEC LOADFMT NAME PORT PLE_DIR
+# Env: MEMFRAC CTX PREFILL ATTN_PREFILL ATTN_DECODE SPEC LOADFMT NAME PORT PLE_DIR
 set -euo pipefail
 
 IMG=${IMG:-lmsysorg/sglang:qwen38flashnext}
@@ -15,7 +15,13 @@ PLE_DIR=${PLE_DIR:-$HOME/flashnext-ple}   # mmap backing store; sparse, persists
 MEMFRAC=${MEMFRAC:-0.85}                  # 0.72 gives total_rest_memory < 0
 CTX=${CTX:-32768}
 PREFILL=${PREFILL:-2048}
-ATTN=${ATTN:-triton}                      # flashinfer hits a CUTLASS SM120 kernel that won't compile
+# flashinfer hits a CUTLASS SM120 kernel that won't compile, so prefill is triton.
+# Decode is a different story: --attention-backend trtllm_mha is refused because it
+# sets BOTH phases and prefill is gated to SM100, but the decode-side check in
+# server_args.py lists is_sm120_supported() explicitly. Splitting them is worth
+# +32% on code (31.5 -> 41.5 tok/s).
+ATTN_PREFILL=${ATTN_PREFILL:-triton}
+ATTN_DECODE=${ATTN_DECODE:-trtllm_mha}
 SPEC=${SPEC:-1}                           # 1 = MTP via NEXTN
 LOADFMT=${LOADFMT:-auto}                  # NB: "dummy" OOMs with PLE offload, see README
 NAME=${NAME:-flashnext}
@@ -59,7 +65,8 @@ docker run -d --name "$NAME" \
     --host 0.0.0.0 --port 30000 \
     --load-format "$LOADFMT" \
     --tp-size 1 \
-    --attention-backend "$ATTN" \
+    --prefill-attention-backend "$ATTN_PREFILL" \
+    --decode-attention-backend "$ATTN_DECODE" \
     --quantization modelopt_fp4 \
     --ple-offload-embedding \
     --language-only \

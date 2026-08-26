@@ -1,8 +1,10 @@
 # Qwen3.8-Flash-Next on one DGX Spark
 
-Serving a **126.0 GiB checkpoint on a machine with 121.63 GiB of memory**, at 31.5 tok/s, with no quality loss.
+Serving a **126.0 GiB checkpoint on a machine with 121.63 GiB of memory**, at 41.5 tok/s on code,
+scoring within noise of the checkpoint's published GSM8K.
 
-Two small patches to SGLang. Reproducible recipe, microbenchmarks, and measured numbers below.
+Two small patches to SGLang, plus one flag most people won't find. Reproducible recipe,
+microbenchmarks, and measured numbers below.
 
 > Day-zero work, 2026-08-26 — the model, the SGLang support PR and this repo are all the same day old.
 > Everything here is measured on one GB10, not projected. Where I'm extrapolating, I say so.
@@ -154,7 +156,8 @@ python3 verify.py     # content -> thinking control -> GSM8K, in that order
 ## The flags that matter, and why
 
 ```
---attention-backend triton              # flashinfer routes to a CUTLASS SM120 kernel that won't compile
+--prefill-attention-backend triton      # trtllm_mha prefill is gated to SM100
+--decode-attention-backend trtllm_mha   # decode explicitly allows SM120 — worth +32% on code
 --quantization modelopt_fp4
 --ple-offload-embedding                 # with patch 1, "offload" means NVMe, not pinned RAM
 --language-only
@@ -173,24 +176,43 @@ One GB10, 121.63 GiB unified memory, tp1, ctx 32k.
 
 | | value |
 |---|---|
-| **GSM8K** (n=60, t=0.6, non-thinking) | **59/60 = 98.3%** — checkpoint reference is 97.27% |
-| decode, code EN | 13.1 tok/s → **31.5** with MTP |
-| decode, prose ES | 13.6 tok/s → **19.5** with MTP |
-| MTP acceptance | len 2.58–2.92 / 4, rate 0.53–0.64 |
-| weights | 80.46 GB body + 1.38 GB draft |
-| KV pool | 275,456 tokens, 15.45 GB free after capture |
+| **GSM8K** (n=200, t=0.6, non-thinking, final config) | **192/200 = 96.0%** — checkpoint reference is 97.27% |
+| decode, code EN (n=5, median) | **41.5 tok/s** (range 40.3–42.3) |
+| decode, prose ES (n=5, median) | **22.8 tok/s** (range 21.2–25.5) |
+| MTP acceptance | len 2.25–3.10 / 4, rate 0.42–0.70 |
+| weights | 81.20 GB body + 0.71 GB draft |
+| KV pool | 271,424 tokens, 16.41 GB free after capture |
 
-n=60 gives roughly ±2 pp, so 98.3% is indistinguishable from the 97.27% reference — the point is that
-**serving the PLE table from NVMe does not degrade the model**. That was the silent failure mode of
-patch 1, and it's the number that rules it out.
+**On the GSM8K number.** At n=200 the standard error is 1.39 pp, so 96.0% sits well inside the noise
+band around the 97.27% reference (the gap is 0.9 SE — not significant). What this rules out is the
+silent failure mode of patch 1: a PLE table served wrong from NVMe would not land here. What it does
+*not* do is prove zero degradation — at this sample size a 2–3 pp regression would be invisible.
 
-MTP helps code far more than prose (2.40× vs 1.43×) — the same asymmetry other speculative decoders
-show on this hardware: the drafter is right about predictable text and wrong about prose.
+An earlier run scored 59/60 = 98.3%, and that number was retired rather than kept: at n=60 one item is
+worth 1.7 pp. It was the flattering read of a noisy sample. Note also that the two runs differ in more
+than sample size — the n=200 run is on the final config (MTP + `trtllm_mha` decode) — so a clean A/B
+would need n=200 without MTP, which has not been run.
+
+**How the speed got there:** 13.1 tok/s on code at first boot → 31.5 with MTP → 41.5 once decode moved
+to `trtllm_mha`. That's 3.2× with no change to the checkpoint. MTP helps code far more than prose, the
+same asymmetry other speculative decoders show on this hardware — the drafter is right about
+predictable text and wrong about prose.
 
 ---
 
 ## Gotchas the docs don't mention
 
+- **`--attention-backend trtllm_mha` is refused, but `--decode-attention-backend trtllm_mha` is not.**
+  The single flag sets both phases, and prefill is gated to SM100:
+
+  ```
+  ValueError: TRTLLM MHA backend for prefill is only supported on Blackwell GPUs (SM100).
+  ```
+
+  Read literally, that says the backend is unavailable. It isn't — the decode-side check in
+  `server_args.py` lists `is_sm120_supported()` explicitly, so consumer Blackwell *is* a supported
+  target for trtllm_mha decode. Splitting the phases gets you **+32% on code** (31.5 → 41.5 tok/s)
+  and costs nothing. This one applies to any sm_120/121 box, model-independent.
 - **`--mem-fraction-static 0.72` will not boot.** `total_rest_memory=-1.00 GB`, dying in
   `_handle_max_mamba_cache` with `mamba_cache_per_req=110.11 MB`. Needs 0.85. Note the ceiling is
   artificial — the physical memory was free the whole time.
@@ -217,10 +239,13 @@ ceiling near 33 tok/s.
 
 Two different kinds of headroom, then:
 
-- **Implementation** (~2.4× to the roofline): `trtllm_mha` is also allowed on sm120 and I never tried
-  it; `--speculative-num-steps` above 3 is untested with an acceptance length of 2.6/4.
+- **Implementation.** Moving decode to `trtllm_mha` already took code from 31.5 to 41.5 tok/s, which
+  closed a good part of this gap. What's left untested: `--speculative-num-steps` above 3, with an
+  acceptance length of only 2.3–3.1 out of 4.
 - **Structural** (moves the roofline itself): quantizing the dense parameters to FP8 would take the
-  ceiling from ~33 to ~55 tok/s. That's a requantization project, not a flag.
+  ceiling from ~33 to ~55 tok/s. That's a requantization project, not a flag. Note that unsloth's GGUF
+  conversions do quantize those parts, which is how `UD-Q4_K_XL` fits in 111.3 GB — at a measurable
+  fidelity cost, and on a stack without prefix caching or MTP.
 
 ## What I have not measured
 
@@ -228,9 +253,15 @@ Two different kinds of headroom, then:
   front, prefill dominates, and that's also where the NVMe-backed PLE would cost the most — the cold
   prefill microbenchmark says 3.9 s worst case for 65k rows with an empty page cache. Treat the
   sub-3% overhead figure as a decode result.
-- **GSM8K with MTP enabled.** Speculative decoding should be lossless by construction; the 98.3% was
-  measured without it.
+- **A clean quality A/B.** The n=200 GSM8K run is on the final config; there is no matched n=200 run
+  without MTP, so sample size and configuration changed together between the two quality runs.
+- **Anything beyond GSM8K.** One benchmark, arithmetic-flavoured. The checkpoint's own card also
+  publishes AIME26 (pass@1 98.75%), which would be a much stronger check and has not been run here.
 - **Contexts beyond 32k**, and concurrency beyond 4 in-flight requests.
+- **The other quantization path.** unsloth publishes GGUF conversions of this model where `UD-Q4_K_XL`
+  (111.3 GB) fits a Spark natively, no patches — at 93.5% of full-precision fidelity by their own
+  metric. Untested here. Their docs independently reach the same conclusion about the PLE table, which
+  is worth reading: *"can be offloaded to SSD via mmap"*.
 
 ## Layout
 
