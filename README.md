@@ -45,6 +45,15 @@ on it.
 
 ## Patch 1 — the PLE table lives on NVMe
 
+The idea is not mine — it is Qwen's, and it is in their [tech report](https://github.com/QwenLM/Qwen3.8-Flash-Next/blob/main/tech_report.pdf) (§2.3.2):
+
+> Because embedding tables are sparsely accessed and deterministically addressed, they can be scaled
+> with negligible additional per-token computation and **stored in off-accelerator storage**.
+
+The whole layer is designed around it. §2.3.1: *"We place it at Layer 2, allowing host-memory
+prefetching to overlap with the computation of the first layer."* What follows is an implementation
+of that for SGLang on a unified-memory box, not a discovery.
+
 The 47.7 GiB PLE table is not a weight matrix you multiply. It's a **lookup table**: 20M rows of 160
 bytes, and a token reads 16 of them. There is exactly one PLE layer (`ple_layer_ids: [2]`), so one
 gather per forward pass.
@@ -183,10 +192,19 @@ One GB10, 121.63 GiB unified memory, tp1, ctx 32k.
 | weights | 81.20 GB body + 0.71 GB draft |
 | KV pool | 271,424 tokens, 16.41 GB free after capture |
 
-**On the GSM8K number.** At n=200 the standard error is 1.39 pp, so 96.0% sits well inside the noise
-band around the 97.27% reference (the gap is 0.9 SE — not significant). What this rules out is the
-silent failure mode of patch 1: a PLE table served wrong from NVMe would not land here. What it does
-*not* do is prove zero degradation — at this sample size a 2–3 pp regression would be invisible.
+**On the GSM8K number, and how far to trust it.** At n=200 the standard error is 1.39 pp, so 96.0%
+sits inside the noise band around the 97.27% reference (the gap is 0.9 SE — not significant).
+
+But the two numbers come from **different harnesses**: 97.27% is RadixArk's, measured with `sgl-eval`;
+96.0% is [`verify.py`](verify.py) in this repo, with its own prompt and last-number extraction. Same
+benchmark, different protocol, so this is an indicative comparison and not a like-for-like one. For
+scale of how much protocol matters: Qwen's own tech report (Tab. 2) reports GSM8K **92.2** for this
+model. Three numbers, three harnesses, one model.
+
+So what this measurement actually establishes is narrow and worth stating plainly: it rules out the
+silent failure mode of patch 1 — a PLE table served wrong from NVMe would not land here. It does not
+prove zero degradation. At this sample size a 2–3 pp regression would be invisible, and against a
+different harness the baseline itself moves by more than that.
 
 An earlier run scored 59/60 = 98.3%, and that number was retired rather than kept: at n=60 one item is
 worth 1.7 pp. It was the flattering read of a noisy sample. Note also that the two runs differ in more
@@ -240,8 +258,14 @@ ceiling near 33 tok/s.
 Two different kinds of headroom, then:
 
 - **Implementation.** Moving decode to `trtllm_mha` already took code from 31.5 to 41.5 tok/s, which
-  closed a good part of this gap. What's left untested: `--speculative-num-steps` above 3, with an
-  acceptance length of only 2.3–3.1 out of 4.
+  closed a good part of this gap. What's left untested: **more MTP steps.** Qwen's tech report (Tab. 4)
+  measures a mean accepted length of **4.07 under four-step speculative decoding** (4.20 on GSM8K,
+  4.26 on HumanEval). This recipe runs three steps and sees 2.25–3.10, so there is measurable room —
+  and it's the paper's number, not a guess.
+- **Another knob from the report** (§2.2, Inference Efficiency): Qwen keep the widened residual state
+  in FP8, which *"halves the bytes moved for the residual state relative to BF16, with almost no loss
+  in quality."* Since decode here is memory-bound, that goes straight to the clock — if SGLang exposes
+  it for this architecture. Not checked.
 - **Structural** (moves the roofline itself): quantizing the dense parameters to FP8 would take the
   ceiling from ~33 to ~55 tok/s. That's a requantization project, not a flag. Note that unsloth's GGUF
   conversions do quantize those parts, which is how `UD-Q4_K_XL` fits in 111.3 GB — at a measurable
@@ -277,6 +301,27 @@ bench/test_mmap_write.py      is the write path bit-exact and the fp8 dequant ri
 bench/test_qsa_kernels.py     the two QSA decode paths, in isolation (needs a free GPU)
 ```
 
+## Page-cache residency, and a measurement I could not trust
+
+[0xBakeer](https://github.com/0xBakeer/qwen38-flash-next-spark) make a point about this table that
+applies here too:
+
+> the n-gram table is 320M rows addressed by a 3-gram hash, so a workload almost never touches the
+> same row twice early on — **it never warms naturally**, even when the table would fit in cache
+> entirely.
+
+Their fix is a tool that warms the table with one sequential read; their A/B measured +6% throughput
+for it. I wrote the equivalent for this recipe and **withdrew it**: `mincore(2)` reported the full
+47.7 GiB as resident even after explicitly evicting a range of it, which cannot be squared with the
+26 GiB of `Cached` that `/proc/meminfo` reports at the same moment. The same tool behaves correctly on
+a small file I control, so the bug is specific to this mapping and I have not found it. Rather than
+ship a number I cannot reconcile, there is no residency tooling here yet.
+
+One asymmetry worth flagging while that stays open: this recipe's loader *writes* the whole table at
+startup, so every page passes through the cache on the way in — unlike an mmap'd read-only GGUF, which
+only faults in what it touches. That may mean the table starts warm here for free. It is a plausible
+story, not a measurement, which is exactly why the tool mattered.
+
 ## A note on method
 
 The two mmap microbenchmarks were written **before** touching SGLang, which is why patch 1 worked on
@@ -288,7 +333,14 @@ and it does not work here, for the reason above.
 
 ## Credits
 
-- [Qwen](https://qwen.ai/blog?id=qwen3.8-flash-next) for the model and the architecture writeup.
+- [Qwen](https://qwen.ai/blog?id=qwen3.8-flash-next) for the model, and for the
+  [tech report](https://github.com/QwenLM/Qwen3.8-Flash-Next/blob/main/tech_report.pdf) — which says
+  outright that these tables belong in off-accelerator storage (§2.3.2). Everything here follows from
+  that sentence.
+- [0xBakeer](https://github.com/0xBakeer/qwen38-flash-next-spark) for the llama.cpp recipe that lands
+  on the same trick from a different stack, and for measuring what this repo had left open: full 262k
+  context, prefill throughput, major-fault counts, and a table-warming A/B. their `warm_table.py` is the
+  tool this repo still owes you.
 - [RadixArk](https://huggingface.co/RadixArk/Qwen3.8-Flash-Next-NVFP4) for the NVFP4 checkpoint and,
   importantly, for publishing a GSM8K number for that exact checkpoint — without a reference score
   there is no way to tell "the model is like this" from "we broke it".
