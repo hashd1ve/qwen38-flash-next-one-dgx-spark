@@ -281,12 +281,22 @@ tip it. If you work at long context, give the box room:
 - **`--max-running-requests 1`** or 2 for long-context work. Each request costs 110 MB of recurrent
   state plus its KV.
 
-There is also a structural contributor, and it is this recipe's fault: the loader **writes** the whole
-PLE table on every boot, so those 47.7 GiB are *dirty* pages. Dirty pages cannot be evicted until
-they are written back, so under pressure the kernel cannot reclaim the one thing it should be able to
-drop instantly. Populating the file once and mapping it read-only afterwards would make those pages
-clean and evictable. That is not implemented yet and it is the most valuable open item here — it was
-on the list as a 2.5-minute startup saving, and it turns out to matter for stability rather than speed.
+**What I do not know is why the kernel could not reclaim its way out of it.** A 47.7 GiB clean,
+file-backed mapping is exactly the kind of memory the page cache is supposed to drop under pressure.
+Two observations that should fit together and don't:
+
+- `mincore(2)` reported the whole table resident even immediately after `POSIX_FADV_DONTNEED` on a
+  range of it, while `/proc/meminfo` reported 26 GiB of `Cached` total at the same moment. Those two
+  cannot both be right, and I have not found which is wrong. (This is why there is no residency
+  tooling in this repo — see above.)
+- My first guess was that the loader *writes* the whole table on every boot, leaving 47.7 GiB of
+  dirty pages that cannot be evicted until written back. **That guess does not survive its own data:**
+  `Dirty` was 154 MB when I looked, so writeback had already happened and the pages were clean. The
+  mechanism is still open.
+
+Populating the file once and mapping it read-only afterwards remains the most interesting open item —
+it would cut 2.5 minutes off every boot regardless, and if page state does turn out to matter it would
+settle that too. But it is a hypothesis to test, not a fix I can claim.
 
 ### A methodology note on the prefill numbers
 
@@ -355,6 +365,8 @@ Two different kinds of headroom, then:
 
 - **Clean cold prefill throughput.** See the methodology note above: the numbers exist but are
   contaminated by prefix reuse, and the uncontaminated re-run is the thing that took the box down.
+- **Why the box could not reclaim.** The stability failure is reproducible and the mitigation works,
+  but the mechanism is unexplained and my first explanation for it was wrong. See above.
 - **A clean quality A/B.** The n=200 GSM8K run is on the final config; there is no matched n=200 run
   without MTP, so sample size and configuration changed together between the two quality runs.
 - **Anything beyond GSM8K.** One benchmark, arithmetic-flavoured. The checkpoint's own card also
