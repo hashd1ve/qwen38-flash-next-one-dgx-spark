@@ -1,7 +1,7 @@
 # Qwen3.8-Flash-Next on one DGX Spark
 
-Serving a **126.0 GiB checkpoint on a machine with 121.63 GiB of memory**, at 41.5 tok/s on code,
-scoring within noise of the checkpoint's published GSM8K.
+Serving a **126.0 GiB checkpoint on a machine with 121.63 GiB of memory** — at 41.5 tok/s on code,
+across the full 262k context, scoring within noise of the checkpoint's published GSM8K.
 
 Two small patches to SGLang, plus one flag most people won't find. Reproducible recipe,
 microbenchmarks, and measured numbers below.
@@ -179,9 +179,15 @@ python3 verify.py     # content -> thinking control -> GSM8K, in that order
 --speculative-draft-model-quantization unquant   # the 31 MTP tensors are BF16 in an NVFP4 checkpoint
 ```
 
+For long-context work, trade KV pool for headroom — see the stability warning below:
+
+```
+MEMFRAC=0.79 PREFILL=1024 CTX=262144 ./scripts/serve.sh
+```
+
 ## Results
 
-One GB10, 121.63 GiB unified memory, tp1, ctx 32k.
+One GB10, 121.63 GiB unified memory, tp1, ctx 32k unless stated.
 
 | | value |
 |---|---|
@@ -217,6 +223,80 @@ same asymmetry other speculative decoders show on this hardware — the drafter 
 predictable text and wrong about prose.
 
 ---
+
+## Long context: it works, and it will take the box down if you are careless
+
+The full 262,144-token context runs. `--context-length 262144` needs no extra memory over 32k, because
+the KV pool is sized in tokens and already holds more than one full context (273,536), and because
+36 of the 48 layers are Gated DeltaNet whose recurrent state is **fixed size per request** and does not
+grow with context. Measured at `--mem-fraction-static 0.85`, ctx 262144, one request at a time:
+
+| Prompt tokens | Time to first token | Needle at midpoint retrieved |
+|---:|---:|:--:|
+| 8,103 | 12.1 s | yes |
+| 32,104 | 38.8 s | yes |
+| 128,104 | 144.3 s | yes |
+| **240,104** | **331.9 s** | **yes** |
+
+The needle is an invented fact ("the access code for the Argamasilla archive is …") inserted at the
+halfway point of a Don Quijote excerpt — real, varied prose, not repeated text a prefix cache would
+compress unfairly. QSA retrieves it at every length including a quarter of a million tokens.
+
+**Prefix caching is what makes this usable.** Sending the same prompt a second time:
+
+| Context | First pass | Cached |
+|---:|---:|---:|
+| 8k | 14.1 s | **0.2 s** |
+| 128k | 183.0 s | **0.6 s** |
+| 240k | 195.6 s | **1.7 s** |
+
+Three minutes of prefill becomes under two seconds. For agent workloads that resend a large context
+every turn, the corpus is paid for once per session rather than once per turn.
+
+**Decode at long context**, measured over 300 generated tokens on a cache hit so the clock is decode
+and not prefill:
+
+| Context | Decode |
+|---:|---:|
+| 8k | 27.3 tok/s |
+| 128k | 24.7 tok/s |
+| 240k | **21.7 tok/s** |
+
+About 20% of degradation across the whole range.
+
+### The stability warning
+
+Running a *sequence* of long prefills — four lengths up to 240k, flushing the prefix cache between
+each so the numbers would be cold — **made the machine unresponsive**. Ping still answered and TCP
+still accepted on every port, but no service completed a response and SSH died during banner
+exchange: classic userspace starvation. It did not recover on its own.
+
+At `--mem-fraction-static 0.85` SGLang takes ~103 GiB and leaves ~18 GiB for the OS, prefill
+activations, and page cache for the 47.7 GiB PLE table. A 240k prefill on top of that is enough to
+tip it. If you work at long context, give the box room:
+
+- **`--mem-fraction-static 0.78`–`0.80`.** There is slack to give back: the KV pool holds 273,536
+  tokens and one full context needs 262,144.
+- **`--chunked-prefill-size 1024`** instead of 2048. Prefill activation memory scales with the chunk.
+- **`--max-running-requests 1`** or 2 for long-context work. Each request costs 110 MB of recurrent
+  state plus its KV.
+
+There is also a structural contributor, and it is this recipe's fault: the loader **writes** the whole
+PLE table on every boot, so those 47.7 GiB are *dirty* pages. Dirty pages cannot be evicted until
+they are written back, so under pressure the kernel cannot reclaim the one thing it should be able to
+drop instantly. Populating the file once and mapping it read-only afterwards would make those pages
+clean and evictable. That is not implemented yet and it is the most valuable open item here — it was
+on the list as a 2.5-minute startup saving, and it turns out to matter for stability rather than speed.
+
+### A methodology note on the prefill numbers
+
+The time-to-first-token column above is trustworthy — those runs each carry a different needle, and the
+clock is dominated by a long measurable phase. The *throughput* figures derived from them (roughly
+670–890 tok/s) are **contaminated** and are not published as a headline: every length is a prefix of
+the same corpus, so the longer runs reuse work the shorter ones cached. The tell is that one 240k run
+reported 1,227 tok/s where a cold one gives ~700 — the most flattering number of the session was the
+one that meant the least. A clean re-measurement with `/flush_cache` between lengths and disjoint
+corpus offsets is the right way to do it; that run is what took the machine down, so it is unfinished.
 
 ## Gotchas the docs don't mention
 
@@ -273,10 +353,8 @@ Two different kinds of headroom, then:
 
 ## What I have not measured
 
-- **End-to-end with long prompts.** All decode numbers here are pure decode. With a large corpus in
-  front, prefill dominates, and that's also where the NVMe-backed PLE would cost the most — the cold
-  prefill microbenchmark says 3.9 s worst case for 65k rows with an empty page cache. Treat the
-  sub-3% overhead figure as a decode result.
+- **Clean cold prefill throughput.** See the methodology note above: the numbers exist but are
+  contaminated by prefix reuse, and the uncontaminated re-run is the thing that took the box down.
 - **A clean quality A/B.** The n=200 GSM8K run is on the final config; there is no matched n=200 run
   without MTP, so sample size and configuration changed together between the two quality runs.
 - **Anything beyond GSM8K.** One benchmark, arithmetic-flavoured. The checkpoint's own card also
@@ -299,6 +377,7 @@ verify.py                     content -> thinking control -> GSM8K
 bench/test_mmap_gather.py     can a Triton kernel read an mmap'd file on this hardware?
 bench/test_mmap_write.py      is the write path bit-exact and the fp8 dequant right?
 bench/test_qsa_kernels.py     the two QSA decode paths, in isolation (needs a free GPU)
+bench/test_long_prefill.py    prefill timing + needle retrieval at long context
 ```
 
 ## Page-cache residency, and a measurement I could not trust
