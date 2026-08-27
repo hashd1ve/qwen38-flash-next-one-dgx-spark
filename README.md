@@ -367,9 +367,25 @@ the sparse attention selects blocks with. That is a real correctness constraint 
 not a conservative guard — unlike the sm100 gate in patch 2, lifting this one would silently degrade
 attention rather than fail loudly.
 
-Lifting it means giving the ring multiple pending groups: `build_pending_ring_slots`, the ring
-allocation in `graph_metadata.py`, the indexer kernel that reads it, and the CUDA-graph shapes. Four
-files including a kernel, with a silent-corruption failure mode.
+Lifting it means giving the ring multiple pending groups. Reading the code rather than guessing at
+it, the shape of that change is narrower than it first looks:
+
+- `build_pending_ring_slots` and `build_group_ring_slots` both key on `position % compress_ratio`;
+  both would key on a wider ring size instead. Both are "pure tensor arithmetic, CUDA-graph safe"
+  by their own docstring.
+- The ring allocation is `num_requests * compress_ratio` and would widen with it.
+- **The capability to compress a completed group mid-verify already exists.** `metadata.py`: *"paged
+  forwards leave [`compress_member_rows`] None and source members from the per-request pending ring
+  instead"* — and paged covers decode and target-verify both. This was the part I assumed was missing;
+  it isn't.
+
+What stays unverified is whether one forward can plan *two* completed groups for the same request,
+which eight draft tokens would require. And the failure mode is still silent: wrong ring slots mean
+the indexer selects the wrong blocks, and the model gets quietly worse rather than crashing.
+
+Two targeted checks exist for exactly that, which is what would make this attemptable rather than
+reckless: the needle-in-a-haystack test at 240k (block selection is precisely what it exercises) and
+GSM8K at n=200.
 
 It is also probably not worth it, which is the part worth writing down. The payoff was estimated by
 interpolating the concurrency curve, but 4 sequences x 4 draft tokens is not the same workload as
