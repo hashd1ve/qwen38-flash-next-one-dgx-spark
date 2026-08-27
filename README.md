@@ -394,6 +394,12 @@ gain has a ceiling: measured at 3, 7 and 15 steps, acceptance grows logarithmica
 grows linearly, so the optimum is a broad plateau at 7–9 steps and **~50 tok/s**. Ring 16 at 15 steps
 measures 42.9 — worse than ring 8.
 
+Acceptance is also not raisable by sampling. Swept on the wide ring at 7 steps, temperature
+0.7 / 0.4 / 0.2 / 0.0 measures 50.2 / 47.7 / 50.0 / 50.7 tok/s with acceptance moving only 2.58 to
+2.65 — even at greedy, where the target is deterministic and the drafter is predicting exactly its
+top-1. Acceptance here is bounded by the drafter's accuracy, not by sampling entropy, and the drafter
+is the MTP head that ships with the model. There is no DFlash2 drafter for this architecture.
+
 It is not the default here for that reason, and because "verified" means two targeted tests and one
 benchmark, not a proof.
 
