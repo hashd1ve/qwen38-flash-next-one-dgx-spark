@@ -405,6 +405,8 @@ Measured, n=10, medians, code prompt. All ranges overlap the baseline's 41.1–4
 | baseline | 42.2 |
 | `--speculative-attention-mode decode` + `--enable-linear-replayssm-spec` + draft on trtllm_mha | 43.6 |
 | `--speculative-attention-mode decode` + `--fp4-gemm-backend flashinfer_cudnn` | 42.2 |
+| `--num-continuous-decode-steps 2` | 41.5 |
+| `--mamba-ssm-dtype bfloat16` (model declares float32) | 41.3 |
 
 **No available kernel flag moves single-stream throughput measurably.** An earlier note in this repo
 claimed `--speculative-attention-mode decode` was worth +17% in forward rate; that came from dividing
@@ -414,6 +416,35 @@ Also already on, and worth knowing so nobody chases them: `SGLANG_ENABLE_QWEN4_P
 true), `index_share_for_mtp_iteration` (default true), and the fused HC mix/combine kernels (this
 model passes both of their conditions — batch ≤ 24 rows and `hc_count × hidden % 2048 == 0`).
 `--enable-scattered-sconv` is a TP-multi-rank optimization and does nothing at `tp=1`.
+
+## The ceiling does not move with acceptance either
+
+Throughput here is `iterations/s x accepted tokens`, so the obvious remaining lever is acceptance —
+and copy-heavy work is where speculative drafting should shine. Five tasks at C=1, ordered from most
+to least "copy":
+
+| Task | tok/s |
+|---|---:|
+| reproduce a code block verbatim | 42.3 |
+| same block, one variable renamed | 42.8 |
+| same block, type hints added | 42.4 |
+| write a new function from scratch | 34.6 |
+| free prose | 23.7 |
+
+Acceptance did rise as predicted — median 3.33 against 2.77 on free generation, hitting the maximum
+of 4.00 — and the verbatim reproduction was correct. **Throughput did not move.** Which means
+iteration time grew in proportion: 66 ms per iteration at 2.77 accepted, 79 ms at 3.33.
+
+A hypothesis for why, stated as one: something in the forward does not amortize over accepted tokens.
+Attention and MoE do — one weight read serves all of them. A recurrence cannot, because `S_t` depends
+on `S_{t-1}`, and **36 of the 48 layers are Gated DeltaNet**. If the GDN state has to be rolled
+forward once per accepted token, accepting more tokens buys proportionally more sequential work and
+throughput pins.
+
+Halving the state width does not help, which is consistent: `--mamba-ssm-dtype bfloat16` against the
+model's declared `float32` measured 41.3 tok/s. That rules out state *bandwidth* and leaves the
+dependency chain, but it does not confirm it. The clean way to settle it would be profiling the GDN
+kernel's share of iteration time, which is not done here.
 
 ## Where the speed actually goes
 
@@ -472,6 +503,7 @@ bench/test_qsa_kernels.py     the two QSA decode paths, in isolation (needs a fr
 bench/test_long_prefill.py    prefill timing + needle retrieval at long context
 bench/test_decode.py          reproducible decode benchmark (n samples, medians)
 bench/test_concurrency.py     concurrency scaling -- is decode bandwidth-bound or latency-bound?
+bench/test_copy_heavy.py      does higher draft acceptance raise throughput? (no)
 ```
 
 ## Page-cache residency, and a measurement I could not trust
