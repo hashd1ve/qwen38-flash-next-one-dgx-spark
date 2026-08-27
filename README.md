@@ -335,7 +335,7 @@ corpus offsets is the right way to do it; that run is what took the machine down
   `modelopt_fp4` from the body.
 - PLE forbids two-batch overlap and NGRAM speculation, and requires `topk=1`.
 
-## Why single-stream stops at ~42 tok/s
+## Why single-stream stops at ~42 tok/s (and how to get to ~50)
 
 Not bandwidth. The decisive measurement is concurrency scaling on the same server:
 
@@ -367,35 +367,35 @@ the sparse attention selects blocks with. That is a real correctness constraint 
 not a conservative guard — unlike the sm100 gate in patch 2, lifting this one would silently degrade
 attention rather than fail loudly.
 
-Lifting it means giving the ring multiple pending groups. Reading the code rather than guessing at
-it, the shape of that change is narrower than it first looks:
+**It is liftable, and I lifted it.** [`patches/qsa_ring_width.py`](patches/qsa_ring_width.py) separates
+the ring's *width* from `compress_ratio` and touches exactly three sites — the buffer allocation in
+`qsa_kv_pool.py`, the two slot builders in `qsa/metadata.py`, and the guard. `compress_ratio` keeps
+its meaning as the micro-block size everywhere else, so the block arithmetic (`block_topk`,
+`compressed_page_size`) is untouched *by construction* rather than by review. Set
+`SGLANG_QSA_RING_WIDTH=8`; without it, original behaviour.
 
-- `build_pending_ring_slots` and `build_group_ring_slots` both key on `position % compress_ratio`;
-  both would key on a wider ring size instead. Both are "pure tensor arithmetic, CUDA-graph safe"
-  by their own docstring.
-- The ring allocation is `num_requests * compress_ratio` and would widen with it.
-- **The capability to compress a completed group mid-verify already exists.** `metadata.py`: *"paged
-  forwards leave [`compress_member_rows`] None and source members from the per-request pending ring
-  instead"* — and paged covers decode and target-verify both. This was the part I assumed was missing;
-  it isn't.
+Measured at `--speculative-num-steps 7 --speculative-num-draft-tokens 8`:
 
-What stays unverified is whether one forward can plan *two* completed groups for the same request,
-which eight draft tokens would require. And the failure mode is still silent: wrong ring slots mean
-the indexer selects the wrong blocks, and the model gets quietly worse rather than crashing.
+| | ring 4 (default) | **ring 8** |
+|---|---:|---:|
+| decode, code EN | 42.2 tok/s | **49.8** |
+| decode, prose ES | 25.6 | 16.4 |
+| max accepted length | 3.95 | **7.12** |
+| GSM8K, n=200 | 96.0% | **96.5%** |
+| needle at 28k | retrieved | retrieved |
 
-Two targeted checks exist for exactly that, which is what would make this attemptable rather than
-reckless: the needle-in-a-haystack test at 240k (block selection is precisely what it exercises) and
-GSM8K at n=200.
+**+18% on code with quality intact** — and the 7.12 is the mechanical proof that more than four draft
+tokens per forward are being accepted, which the original ring made impossible.
 
-It is also probably not worth it, which is the part worth writing down. The payoff was estimated by
-interpolating the concurrency curve, but 4 sequences x 4 draft tokens is not the same workload as
-1 sequence x 16 - those four carry independent GDN states and KV, this one shares them. And acceptance
-decays with draft depth: this setup accepts 2.77 of a possible 4, so draft tokens 5 through 8 would
-land far below that. Iteration time scales sublinearly with rows (4x rows cost 1.8x time at C=4), so
-eight rows at maybe 3.5 accepted works out around **48 tok/s** - a real gain, but not the 60 the
-interpolation suggested, and not worth a correctness-risky rewrite to find out.
+Two things to know before using it. **Prose gets 36% slower**: seven draft steps cost 23 ms and prose
+accepts 0.42 of them, so you pay for drafts that get rejected. This is a code-tuned trade, and the
+flag that would adapt it per-request (`--speculative-adaptive`) is incompatible with the PLE. And the
+gain has a ceiling: measured at 3, 7 and 15 steps, acceptance grows logarithmically while draft cost
+grows linearly, so the optimum is a broad plateau at 7–9 steps and **~50 tok/s**. Ring 16 at 15 steps
+measures 42.9 — worse than ring 8.
 
-Single-stream on this checkpoint and this box looks like a ~42 tok/s problem.
+It is not the default here for that reason, and because "verified" means two targeted tests and one
+benchmark, not a proof.
 
 ## sm_121 is a second-class citizen, systematically
 
@@ -538,6 +538,7 @@ Two different kinds of headroom, then:
 ```
 patches/ple_mmap.py           patch 1 — applied to models/qwen4_exp.py
 patches/qsa_trtllm_sm120.py   patch 2 — applied to layers/attention/qwen_sparse_attn_backend.py
+patches/qsa_ring_width.py     EXPERIMENTAL — widens the QSA pending ring past 4 draft tokens
 scripts/download.sh           fetch the NVFP4 checkpoint
 scripts/prepare.sh            extract from the image, patch, verify by AST
 scripts/serve.sh              launch
