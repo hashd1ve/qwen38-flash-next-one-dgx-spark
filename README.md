@@ -423,6 +423,7 @@ Measured, n=10, medians, code prompt. All ranges overlap the baseline's 41.1–4
 | `--speculative-attention-mode decode` + `--fp4-gemm-backend flashinfer_cudnn` | 42.2 |
 | `--num-continuous-decode-steps 2` | 41.5 |
 | `--mamba-ssm-dtype bfloat16` (model declares float32) | 41.3 |
+| `--enable-tf32-matmul` | 40.8 |
 
 **No available kernel flag moves single-stream throughput measurably.** An earlier note in this repo
 claimed `--speculative-attention-mode decode` was worth +17% in forward rate; that came from dividing
@@ -480,10 +481,15 @@ on `S_{t-1}`, and **36 of the 48 layers are Gated DeltaNet**. If the GDN state h
 forward once per accepted token, accepting more tokens buys proportionally more sequential work and
 throughput pins.
 
-Halving the state width does not help, which is consistent: `--mamba-ssm-dtype bfloat16` against the
-model's declared `float32` measured 41.3 tok/s. That rules out state *bandwidth* and leaves the
-dependency chain, but it does not confirm it. The clean way to settle it would be profiling the GDN
-kernel's share of iteration time, which is not done here.
+**That hypothesis did not survive its own tests.** Two knobs aim at it from different directions and
+neither moves anything: `--mamba-ssm-dtype bfloat16` against the model's declared `float32` (halving
+the state's bytes) measures 41.3, and `--enable-tf32-matmul` (speeding the fp32 matmuls the recurrence
+runs on) measures 40.8. If the GDN recurrence were the bottleneck, one of those should have shown.
+
+What is left is the plainer reading, and it is the one the concurrency scaling already pointed at: at
+batch 1 a forward is 48 layers of small kernels with the GPU underutilized, and no single component
+dominates. That is what "latency-bound" means here, and it is why concurrency fixes it and nothing
+else does.
 
 ## Where the speed actually goes
 
