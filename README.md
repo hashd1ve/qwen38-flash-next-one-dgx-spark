@@ -335,6 +335,76 @@ corpus offsets is the right way to do it; that run is what took the machine down
   `modelopt_fp4` from the body.
 - PLE forbids two-batch overlap and NGRAM speculation, and requires `topk=1`.
 
+## Why single-stream stops at ~42 tok/s
+
+Not bandwidth. The decisive measurement is concurrency scaling on the same server:
+
+| Concurrent requests | Aggregate | Per sequence | Scaling |
+|---:|---:|---:|---|
+| 1 | 42.8 tok/s | 42.8 | 1.00× |
+| 2 | 53.2 | 29.1 | 1.25× |
+| 4 | **95.2** | 27.3 | 2.23× |
+
+The box delivers **95 tok/s** when given enough work. At C=1 it delivers 42.8. So single-stream is
+**latency-bound, with roughly 2.2× of capacity sitting idle** — not starved of memory bandwidth, which
+is what I assumed for most of a night before measuring it.
+
+The way to use that headroom without concurrency is to verify more speculative tokens per forward.
+C=4 with 4 draft tokens is 16 token-rows per forward and yields 95 tok/s; C=1 is 4 rows and yields
+42.8. Eight rows at C=1 would interpolate to roughly 60.
+
+**And that is exactly what is capped.** From `qwen_sparse_attn_backend.py`:
+
+```
+NotImplementedError: Qwen QSA requires speculative_num_draft_tokens <= the QSA compress ratio (4):
+the pending index-key ring holds one group; got 8
+```
+
+with the reason in the comment right above it: *"The pending-group ring keys state by
+`position % ratio`"*. The indexer's pending compressed-key ring has exactly `compress_ratio` slots, so
+verifying more than 4 tokens at once makes two of them collide in the same slot and corrupts the keys
+the sparse attention selects blocks with. That is a real correctness constraint of the implementation,
+not a conservative guard — unlike the sm100 gate in patch 2, lifting this one would silently degrade
+attention rather than fail loudly.
+
+Lifting it means giving the ring multiple pending groups: real surgery in the QSA backend, with a
+silent-corruption failure mode. It is the one identified path from 42 to ~60 single-stream, and it is
+not attempted here.
+
+## sm_121 is a second-class citizen, systematically
+
+Patch 2 is not an isolated gap. Every one of these was hit on this box, with its exact error:
+
+| What | Result on sm_121 |
+|---|---|
+| QSA trtllm-gen decode | gated to sm100; falls through to an FA4-cute path that will not compile (patch 2) |
+| `--attention-backend trtllm_mha` | *"TRTLLM MHA backend for prefill is only supported on Blackwell GPUs (SM100)"* — decode is fine, the single flag sets both |
+| `--moe-runner-backend flashinfer_trtllm` | *"cubin manifest contains no kernels runnable on sm121; ships cubins for sm100, sm103 and sm107"* |
+| `--moe-runner-backend flashinfer_cutedsl` | *"No supported CUDA architectures found for major versions [10]"* |
+| `--enable-torch-compile` | `NotImplementedError` during CUDA graph capture inside the model forward |
+
+Of three flashinfer MoE backends, only `flashinfer_cutlass` runs here. Consumer Blackwell — RTX
+50-series as much as GB10 — keeps landing on the generic path or on nothing at all.
+
+## Kernel flags that changed nothing
+
+Measured, n=10, medians, code prompt. All ranges overlap the baseline's 41.1–43.2:
+
+| Configuration | tok/s |
+|---|---:|
+| baseline | 42.2 |
+| `--speculative-attention-mode decode` + `--enable-linear-replayssm-spec` + draft on trtllm_mha | 43.6 |
+| `--speculative-attention-mode decode` + `--fp4-gemm-backend flashinfer_cudnn` | 42.2 |
+
+**No available kernel flag moves single-stream throughput measurably.** An earlier note in this repo
+claimed `--speculative-attention-mode decode` was worth +17% in forward rate; that came from dividing
+throughput by a noisy acceptance figure and does not survive direct comparison. Retracted.
+
+Also already on, and worth knowing so nobody chases them: `SGLANG_ENABLE_QWEN4_PLE_FUSION` (default
+true), `index_share_for_mtp_iteration` (default true), and the fused HC mix/combine kernels (this
+model passes both of their conditions — batch ≤ 24 rows and `hc_count × hidden % 2048 == 0`).
+`--enable-scattered-sconv` is a TP-multi-rank optimization and does nothing at `tp=1`.
+
 ## Where the speed actually goes
 
 13.5 tok/s without speculation is about **41% of the memory-bandwidth roofline**, and the reason is
@@ -390,6 +460,8 @@ bench/test_mmap_gather.py     can a Triton kernel read an mmap'd file on this ha
 bench/test_mmap_write.py      is the write path bit-exact and the fp8 dequant right?
 bench/test_qsa_kernels.py     the two QSA decode paths, in isolation (needs a free GPU)
 bench/test_long_prefill.py    prefill timing + needle retrieval at long context
+bench/test_decode.py          reproducible decode benchmark (n samples, medians)
+bench/test_concurrency.py     concurrency scaling -- is decode bandwidth-bound or latency-bound?
 ```
 
 ## Page-cache residency, and a measurement I could not trust
