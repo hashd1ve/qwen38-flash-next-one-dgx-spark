@@ -367,9 +367,19 @@ the sparse attention selects blocks with. That is a real correctness constraint 
 not a conservative guard — unlike the sm100 gate in patch 2, lifting this one would silently degrade
 attention rather than fail loudly.
 
-Lifting it means giving the ring multiple pending groups: real surgery in the QSA backend, with a
-silent-corruption failure mode. It is the one identified path from 42 to ~60 single-stream, and it is
-not attempted here.
+Lifting it means giving the ring multiple pending groups: `build_pending_ring_slots`, the ring
+allocation in `graph_metadata.py`, the indexer kernel that reads it, and the CUDA-graph shapes. Four
+files including a kernel, with a silent-corruption failure mode.
+
+It is also probably not worth it, which is the part worth writing down. The payoff was estimated by
+interpolating the concurrency curve, but 4 sequences x 4 draft tokens is not the same workload as
+1 sequence x 16 - those four carry independent GDN states and KV, this one shares them. And acceptance
+decays with draft depth: this setup accepts 2.77 of a possible 4, so draft tokens 5 through 8 would
+land far below that. Iteration time scales sublinearly with rows (4x rows cost 1.8x time at C=4), so
+eight rows at maybe 3.5 accepted works out around **48 tok/s** - a real gain, but not the 60 the
+interpolation suggested, and not worth a correctness-risky rewrite to find out.
+
+Single-stream on this checkpoint and this box looks like a ~42 tok/s problem.
 
 ## sm_121 is a second-class citizen, systematically
 
