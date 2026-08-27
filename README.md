@@ -417,6 +417,29 @@ true), `index_share_for_mtp_iteration` (default true), and the fused HC mix/comb
 model passes both of their conditions — batch ≤ 24 rows and `hc_count × hidden % 2048 == 0`).
 `--enable-scattered-sconv` is a TP-multi-rank optimization and does nothing at `tp=1`.
 
+## What an iteration is actually made of
+
+Measured on the documented config, C=1, code prompt, n=10:
+
+| | tok/s | implies |
+|---|---:|---|
+| speculation off | **17.8** | 56 ms per target forward |
+| speculation on (3 steps, 4 draft tokens) | 42.2 | 66 ms per iteration, 2.77 accepted |
+
+An iteration is `3 x draft + 1 x target`, so 66 = 3d + 56 gives **d = 3.3 ms per draft forward**. The
+draft is nearly free: 10 ms of a 66 ms iteration. The target forward is 85% of it, and speculation is
+worth a clean **2.4x** over not speculating.
+
+Two things follow. Fewer speculative steps cannot help — you would save 3.3 ms and lose acceptance,
+so 3 steps is optimal, and the QSA cap at 4 draft tokens is not costing draft compute, it is costing
+*width*. And the same decomposition revises the estimate for widening the ring upward: seven steps
+would add 23 ms of draft to a 79 ms iteration, and at 4.5–5 accepted that lands at **57–63 tok/s**,
+not the ~48 estimated earlier from the concurrency curve. Wide error bars in both directions, and
+still gated behind a correctness-risky rewrite of four files.
+
+It also independently confirms the `--decode-attention-backend trtllm_mha` win on a measurement with
+no speculation noise in it: 13.1 tok/s with triton decode against **17.8** with trtllm_mha, +36%.
+
 ## The ceiling does not move with acceptance either
 
 Throughput here is `iterations/s x accepted tokens`, so the obvious remaining lever is acceptance —
