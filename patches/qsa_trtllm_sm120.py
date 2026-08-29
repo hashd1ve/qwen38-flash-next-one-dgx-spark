@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
-"""Enable the QSA trtllm-gen decode kernel on sm_120/121 (consumer Blackwell).
+"""DEPRECATED (2026-08-29) -- DO NOT APPLY. Kept for the record only.
+
+Widening this gate routes sm_121 onto flashinfer XQA, which silently corrupts
+long-context decode on GB10 (token-0 runs in 1/4 requests at 120k, 4/4 at 210k;
+sglang#36806). Use qsa_sm121_triton.py instead.
+
+Original description follows.
+
+Enable the QSA trtllm-gen decode kernel on sm_120/121 (consumer Blackwell).
 
 `_resolve_trtllm_sparse_decode` drops the kernel when `is_sm100_supported()` is
 false. GB10 is Blackwell but reports (12, 1), so it exits there and falls back to

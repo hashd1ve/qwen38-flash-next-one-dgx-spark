@@ -27,12 +27,13 @@ LOADFMT=${LOADFMT:-auto}                  # NB: "dummy" OOMs with PLE offload, s
 NAME=${NAME:-flashnext}
 PORT=${PORT:-30000}
 
-for f in qwen4_exp.py qwen_sparse_attn_backend.py path_qwen4_exp.txt path_qsa.txt; do
+for f in qwen4_exp.py qwen_sparse_attn_backend.py sm121_varlen.py path_qwen4_exp.txt path_qsa.txt path_sm121_varlen.txt; do
   [ -f "$BUILD/$f" ] || { echo "missing $BUILD/$f — run ./scripts/prepare.sh first"; exit 1; }
 done
 mkdir -p "$PLE_DIR"
 PATH_MODEL=$(cat "$BUILD/path_qwen4_exp.txt")
 PATH_QSA=$(cat "$BUILD/path_qsa.txt")
+PATH_SM121=$(cat "$BUILD/path_sm121_varlen.txt")
 
 # MTP: 1 layer, already inside the checkpoint. Its 31 tensors are still BF16
 # (RadixArk quantized only the routed experts), hence "unquant" for the draft:
@@ -57,6 +58,7 @@ docker run -d --name "$NAME" \
   -v "$PLE_DIR":/ple \
   -v "$BUILD/qwen4_exp.py":"$PATH_MODEL":ro \
   -v "$BUILD/qwen_sparse_attn_backend.py":"$PATH_QSA":ro \
+  -v "$BUILD/sm121_varlen.py":"$PATH_SM121":ro \
   -e SGLANG_QWEN4_PLE_MMAP_DIR=/ple \
   "$IMG" \
   python3 -m sglang.launch_server \

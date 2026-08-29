@@ -9,6 +9,15 @@ microbenchmarks, and measured numbers below.
 > Day-zero work, 2026-08-26 — the model, the SGLang support PR and this repo are all the same day old.
 > Everything here is measured on one GB10, not projected. Where I'm extrapolating, I say so.
 
+> **Correction (2026-08-29).** Patch 2 as first published — widening the trtllm gate to sm_12x — was
+> wrong: on GB10 that path is flashinfer **XQA**, and it silently corrupts long-context decode (runs of
+> token id 0 in 1/4 requests at 120k prompt tokens, 4/4 at 210k; HTTP 200 throughout). Upstream measured
+> it on two independent Spark setups and retired the widening in
+> [sglang#36806](https://github.com/sgl-project/sglang/pull/36806); the fix for GB10 is the Triton varlen
+> fallback of [sglang#36845](https://github.com/sgl-project/sglang/pull/36845), which this recipe now
+> ships as patch 2 and which I validated here: **exact needle retrieval 4/4 at each of 120k, 190k and
+> 210k**. If you cloned this before 2026-08-29, re-run `./scripts/prepare.sh`. Details in the patch 2 section.
+
 ---
 
 ## The problem
@@ -95,7 +104,7 @@ what has been written.
 the fp8 bytes without applying the scale would serve wrong embeddings silently; [`bench/test_mmap_write.py`](bench/test_mmap_write.py)
 checks the write path is bit-exact and the dequant matches.
 
-## Patch 2 — QSA has no decode kernel on sm_121
+## Patch 2 — QSA has no decode kernel on sm_121 (and the obvious fix is wrong)
 
 `is_sm100_supported()` requires `major == 10`. GB10 is `(12, 1)`. Two independent sites gate on it and
 together they dead-end:
@@ -113,22 +122,44 @@ MLIRError: expects `coord` and shape of view are weakly congruent, but got
   flash_attn/cute/flash_fwd.py:393, in epilogue
 ```
 
-It does select an SM120 path (`flash_attncuteflash_fwd_sm120FlashAttentionForwardSm120`) — a rank-2
-layout indexed with a rank-3 coordinate. Net result: **no working QSA decode path at all** on sm_121.
+Net result: **no working QSA decode path at all** on sm_121. Setting `--attention-backend triton` fixes
+the first site only.
 
-Setting `--attention-backend triton` alone is *not* enough, because the second gate is independent of
-that flag. Widening it is:
+### What I did first, and why it was wrong
 
-```diff
--    if not is_sm100_supported():
-+    if not (is_sm100_supported() or is_sm120_supported()):
-         return None
-```
+The first version of this patch widened the gate (`is_sm100_supported() or is_sm120_supported()`), on
+the reasoning that flashinfer 0.6.17 ships `trtllm_batch_decode_with_kv_cache` for this device and
+would fail loudly if it didn't. It does not fail loudly. On sm_12x that call does not run trtllm-gen at
+all — there are no sm12x cubins — it routes to **XQA**, and XQA is numerically wrong on GB10 once the
+sparse selection has to prune, i.e. with more than `indexer_budget` (2048) tokens of history, and
+visibly so only from ~120k tokens up. Two independent measurements with real weights
+([dpolistwm, 2 Sparks TP=2](https://github.com/sgl-project/sglang/pull/36556#issuecomment-5448079828);
+[BBuf, 2 Sparks](https://github.com/sgl-project/sglang/pull/36806#issuecomment-5450800691)):
 
-flashinfer 0.6.17 does ship a working `trtllm_batch_decode_with_kv_cache` on this device.
+| prompt tokens | XQA path (the old patch 2) |
+|---:|---|
+| 120k | **1/4 corrupt** — 32× `!` (token id 0), HTTP 200 |
+| 190k | **2/4 corrupt** |
+| 210k | **4/4 corrupt** |
 
-**This is not Spark-specific.** Any consumer Blackwell (sm_120/121) hits it — RTX 50-series included.
-Reported upstream: [sgl-project/sglang#36497](https://github.com/sgl-project/sglang/pull/36497#issuecomment-5427832100).
+Every short benchmark in this README, GSM8K included, never enters that kernel. My own two long-context
+runs (128k and 240k, needle found) were n=1 each — consistent with "1 in 4", not evidence against it.
+That is the lesson: a widened gate has to be tested in the regime the gate was protecting, with n ≥ 4,
+not in the regime already being measured.
+
+### The patch that is right
+
+Upstream retired the widening ([sglang#36806](https://github.com/sgl-project/sglang/pull/36806): exact
+`is_sm120()` only, GB10 excluded) and BBuf added a narrow Triton online-softmax kernel as the sm_121
+varlen fallback ([sglang#36845](https://github.com/sgl-project/sglang/pull/36845): one query per
+sequence, device-side `cu_seqlens`, CUDA-graph safe). `patches/qsa_sm121_triton.py` inserts that hunk
+into the image's backend and `patches/qsa_sm121_varlen.py` is the kernel, verbatim; `serve.sh` mounts it.
+
+Validated on this Spark (2026-08-29): the kernel against a PyTorch reference at the model's real shape
+(24 query heads / 2 KV heads / head dim 256, which the PR's differential tests did not cover) — max
+abs error 0.001, CUDA-graph replay with changed lengths ok, 0.10 ms per call; then end to end,
+**needle retrieval 4/4 exact at 120k, 190k and 210k prompt tokens**, decode 30–48 tok/s after those
+prompts, code suite unchanged. The short-context numbers below are unaffected: the dense path is the same.
 
 ---
 
@@ -409,7 +440,7 @@ Patch 2 is not an isolated gap. Every one of these was hit on this box, with its
 
 | What | Result on sm_121 |
 |---|---|
-| QSA trtllm-gen decode | gated to sm100; falls through to an FA4-cute path that will not compile (patch 2) |
+| QSA trtllm-gen decode | gated to sm100; falls through to an FA4-cute path that will not compile. Widening the gate routes to XQA, which corrupts silently ≥120k tokens (patch 2, corrected) |
 | `--attention-backend trtllm_mha` | *"TRTLLM MHA backend for prefill is only supported on Blackwell GPUs (SM100)"* — decode is fine, the single flag sets both |
 | `--moe-runner-backend flashinfer_trtllm` | *"cubin manifest contains no kernels runnable on sm121; ships cubins for sm100, sm103 and sm107"* |
 | `--moe-runner-backend flashinfer_cutedsl` | *"No supported CUDA architectures found for major versions [10]"* |
@@ -543,7 +574,9 @@ Two different kinds of headroom, then:
 
 ```
 patches/ple_mmap.py           patch 1 — applied to models/qwen4_exp.py
-patches/qsa_trtllm_sm120.py   patch 2 — applied to layers/attention/qwen_sparse_attn_backend.py
+patches/qsa_sm121_triton.py   patch 2 — applied to layers/attention/qwen_sparse_attn_backend.py (sglang#36845)
+patches/qsa_sm121_varlen.py   the Triton kernel behind patch 2, mounted by serve.sh
+patches/qsa_trtllm_sm120.py   DEPRECATED — the first patch 2; corrupts long-context decode on GB10
 patches/qsa_ring_width.py     EXPERIMENTAL — widens the QSA pending ring past 4 draft tokens
 scripts/download.sh           fetch the NVFP4 checkpoint
 scripts/prepare.sh            extract from the image, patch, verify by AST
