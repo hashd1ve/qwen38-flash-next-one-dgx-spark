@@ -147,7 +147,20 @@ runs (128k and 240k, needle found) were n=1 each — consistent with "1 in 4", n
 That is the lesson: a widened gate has to be tested in the regime the gate was protecting, with n ≥ 4,
 not in the regime already being measured.
 
-### The patch that is right
+### Updated 2026-08-30: the merged kernel (and this recipe ships it)
+
+Upstream merged [sglang#36845](https://github.com/sgl-project/sglang/pull/36845) with a **different, faster
+kernel** than its 2026-08-28 revision: an agent-optimized implementation (Codex + Kimi K3 via
+[KDA-1.5](https://github.com/radixark/KDA-1.5)) under `sglang/kernels/kda_kernels/qwen38_qsa_sm121/` —
+BF16 tensor-core QK/PV with FP32 online softmax and in-launch split-KV merge, specialized to this model's
+exact decode contract. On this GB10 it measures **4-5x the 2026-08-28 Triton kernel** at decode batch 1-4
+(28 us vs 154 at batch 1) with identical numerics. The recipe now vendors that package verbatim
+(`patches/kda_kernels/`) and routes to it inside its contract, keeping the 2026-08-28 Triton kernel as the
+fallback outside it (`patches/qsa_sm121_kda.py` + `patches/qsa_sm121_varlen.py`). Validated here:
+needle retrieval **9/9 exact** at 120k/190k/210k, decode after those prompts 46-92 tok/s (previously
+30-48), short-context decode unchanged.
+
+### The 2026-08-28 patch (now the fallback)
 
 Upstream retired the widening ([sglang#36806](https://github.com/sgl-project/sglang/pull/36806): exact
 `is_sm120()` only, GB10 excluded) and BBuf added a narrow Triton online-softmax kernel as the sm_121
@@ -574,8 +587,10 @@ Two different kinds of headroom, then:
 
 ```
 patches/ple_mmap.py           patch 1 — applied to models/qwen4_exp.py
-patches/qsa_sm121_triton.py   patch 2 — applied to layers/attention/qwen_sparse_attn_backend.py (sglang#36845)
-patches/qsa_sm121_varlen.py   the Triton kernel behind patch 2, mounted by serve.sh
+patches/qsa_sm121_kda.py      patch 2 — applied to layers/attention/qwen_sparse_attn_backend.py (sglang#36845, merged revision)
+patches/kda_kernels/          the merged KDA kernel package, vendored verbatim, mounted by serve.sh
+patches/qsa_sm121_varlen.py   the 2026-08-28 Triton kernel, kept as the out-of-contract fallback
+patches/qsa_sm121_triton.py   the 2026-08-28 patcher, superseded by qsa_sm121_kda.py
 patches/qsa_trtllm_sm120.py   DEPRECATED — the first patch 2; corrupts long-context decode on GB10
 patches/qsa_ring_width.py     EXPERIMENTAL — widens the QSA pending ring past 4 draft tokens
 scripts/download.sh           fetch the NVFP4 checkpoint
